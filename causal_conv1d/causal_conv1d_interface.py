@@ -25,9 +25,11 @@ class CausalConv1dFn(torch.autograd.Function):
             x = x.contiguous()
         bias = bias.contiguous() if bias is not None else None
         if seq_idx is not None:
+            """
             assert (
                 initial_states is None
             ), "initial_states must be None if seq_idx is not None"
+            """
             assert (
                 not return_final_states
             ), "If seq_idx is not None, we don't return final_states_out"

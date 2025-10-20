@@ -201,7 +201,9 @@ causal_conv1d_fwd(const at::Tensor &x,
         auto initial_states = initial_states_.value();
         TORCH_CHECK(initial_states.scalar_type() == input_type);
         TORCH_CHECK(initial_states.is_cuda());
-        CHECK_SHAPE(initial_states, batch_size, dim, width - 1);
+        if (!seq_idx_.has_value()) {
+            CHECK_SHAPE(initial_states, batch_size, dim, width - 1);
+        }
         TORCH_CHECK(initial_states.stride(1) == 1);
         params.initial_states_ptr = initial_states.data_ptr();
         params.initial_states_batch_stride = initial_states.stride(0);

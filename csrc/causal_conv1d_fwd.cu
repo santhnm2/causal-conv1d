@@ -235,14 +235,9 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
         + chunk_c_id * kChunkSizeC * params.weight_c_stride;
     input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * params.out_batch_stride
         + (chunk_l_id * kChunkSizeL + l_idx) * params.out_l_stride + chunk_c_id * kChunkSizeC + c_idx * kNElts;
-    int *seq_idx = !kHasSeqIdx ? nullptr : reinterpret_cast<int *>(params.seq_idx_ptr)
-        + batch_id * params.seqlen + chunk_l_id * kChunkSizeL;
-    input_t *initial_states = params.initial_states_ptr == nullptr || chunk_l_id > 0 ? nullptr
-        : reinterpret_cast<input_t *>(params.initial_states_ptr) + batch_id * params.initial_states_batch_stride + l_idx * params.initial_states_l_stride + chunk_c_id * kChunkSizeC + c_idx * kNElts;
-    // The last L-chunk will also have enough info to write to final states, since it also contain a few x values
-    // from the previous L-chunk.
-    input_t *final_states = params.final_states_ptr == nullptr || chunk_l_id < gridDim.y - 1 ? nullptr
-        : reinterpret_cast<input_t *>(params.final_states_ptr) + batch_id * params.final_states_batch_stride + l_idx * params.final_states_l_stride + chunk_c_id * kChunkSizeC + c_idx * kNElts;
+
+    // Get a pointer to the entire seq_idx tensor.
+    int *seq_idx_ptr = !kHasSeqIdx ? nullptr : reinterpret_cast<int *>(params.seq_idx_ptr);
 
     #pragma unroll
     for (int l = 0; l < Ktraits::kNLoads; ++l) {
@@ -253,29 +248,45 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
         }
         reinterpret_cast<vec_t *>(x_smem[kWidth - 1 + l * kLPerLoad + l_idx])[c_idx] = reinterpret_cast<vec_t *>(x_vals_load)[0];
     }
-    // Load the elements from the previous chunk that are needed for convolution.
+    // Load the elements from the previous chunk or initial_states that are needed for convolution.
     if (l_idx < kWidth - 1) {
         input_t x_vals_load[kNElts] = {0};
-        if (chunk_l_id * kChunkSizeL + l_idx - (kWidth - 1) >= 0
-            && chunk_l_id * kChunkSizeL + l_idx - (kWidth - 1) < params.seqlen
-            && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
-            reinterpret_cast<vec_t *>(x_vals_load)[0] = *reinterpret_cast<vec_t *>(x - (kWidth - 1) * params.x_l_stride);
-        } else if (initial_states != nullptr
-                   && chunk_l_id * kChunkSizeL + l_idx - (kWidth - 1) < 0
-                   && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
-            reinterpret_cast<vec_t *>(x_vals_load)[0] = *reinterpret_cast<vec_t *>(initial_states);
+        const int needed_global_l_idx = chunk_l_id * kChunkSizeL + l_idx - (kWidth - 1);
+        const int current_global_l_idx = chunk_l_id * kChunkSizeL + l_idx;
+        if (needed_global_l_idx >= 0) { // Load from previous part of x
+            if (needed_global_l_idx < params.seqlen && current_global_l_idx < params.seqlen && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
+                // Only load if the previous token belongs to the same sequence.
+                if (!kHasSeqIdx || (seq_idx_ptr[needed_global_l_idx] == seq_idx_ptr[current_global_l_idx])) {
+                    reinterpret_cast<vec_t *>(x_vals_load)[0] = *reinterpret_cast<vec_t *>(x - (kWidth - 1) * params.x_l_stride);
+                }
+            }
+        } else { // Load from initial_states
+            if (params.initial_states_ptr != nullptr && current_global_l_idx < params.seqlen && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
+                const int request_id = kHasSeqIdx ? seq_idx_ptr[current_global_l_idx] : batch_id;
+                const int state_l_idx = kWidth - 1 + needed_global_l_idx;
+                input_t *p_initial_state = reinterpret_cast<input_t *>(params.initial_states_ptr)
+                                          + request_id * params.initial_states_batch_stride
+                                          + state_l_idx * params.initial_states_l_stride
+                                          + chunk_c_id * kChunkSizeC + c_idx * kNElts;
+                reinterpret_cast<vec_t *>(x_vals_load)[0] = *reinterpret_cast<vec_t *>(p_initial_state);
+            }
         }
         reinterpret_cast<vec_t *>(x_smem[l_idx])[c_idx] = reinterpret_cast<vec_t *>(x_vals_load)[0];
     }
 
     __syncthreads();
 
-    if (final_states != nullptr
-        && l_idx < kWidth - 1
-        && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
-        // x_smem[0] contains element at index chunk_l_id * kChunkSizeL - (kWidth - 1)
-        // So last few elements (index params.seqlen - kWidth + 1 + l_idx) are stored in x_smem[params.seqlen - kWidth + 1 + l_idx - (chunk_l_id * kChunkSizeL - kWidth + 1)][c_idx]
-        *reinterpret_cast<vec_t *>(final_states) = reinterpret_cast<vec_t *>(x_smem[params.seqlen + l_idx - chunk_l_id * kChunkSizeL])[c_idx];
+    // Write the final states, indexed by request_id from seq_idx.
+    if (params.final_states_ptr != nullptr && chunk_l_id == gridDim.y - 1 && l_idx < kWidth - 1) {
+        const int final_global_l_idx = params.seqlen - (kWidth - 1) + l_idx;
+        if (final_global_l_idx >= 0 && final_global_l_idx < params.seqlen && chunk_c_id * kChunkSizeC + c_idx * kNElts < params.dim) {
+            const int request_id = kHasSeqIdx ? seq_idx_ptr[final_global_l_idx] : batch_id;
+            input_t *p_final_state = reinterpret_cast<input_t *>(params.final_states_ptr)
+                                      + request_id * params.final_states_batch_stride
+                                      + l_idx * params.final_states_l_stride
+                                      + chunk_c_id * kChunkSizeC + c_idx * kNElts;
+            *reinterpret_cast<vec_t *>(p_final_state) = reinterpret_cast<vec_t *>(x_smem[params.seqlen + l_idx - chunk_l_id * kChunkSizeL])[c_idx];
+        }
     }
 
     constexpr int kLPerThread = constexpr_min(kChunkSizeL * kChunkSizeC / kNThreads, kChunkSizeL);
@@ -308,7 +319,8 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
     if constexpr (kHasSeqIdx) {
         #pragma unroll
         for (int i = 0; i < kWidth - 1 + kLPerThread; ++i) {
-            seq_idx_thread[i] = chunk_l_id * kChunkSizeL + col_idx * kLPerThread + i - (kWidth - 1) >= 0 ? seq_idx[col_idx * kLPerThread + i - (kWidth - 1)] : -1;
+            const int global_l_idx = chunk_l_id * kChunkSizeL + col_idx * kLPerThread + i - (kWidth - 1);
+            seq_idx_thread[i] = (global_l_idx >= 0 && global_l_idx < params.seqlen) ? seq_idx_ptr[global_l_idx] : -1;
         }
     }
 
@@ -316,21 +328,22 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
     #pragma unroll
     for (int i = 0; i < kLPerThread; ++i) {
         out_vals[i] = bias_val;
-        const int seq_idx_cur = !kHasSeqIdx ? 0 : seq_idx_thread[i + kWidth - 1];
-        // For padding tokens (seq_idx < 0), we skip the computation and set the output to 0.
-        if (seq_idx_cur < 0) {
-            out_vals[i] = 0.f;
-            continue;
-        }
-        #pragma unroll
-        for (int w = 0; w < kWidth; ++w) {
-            if constexpr (!kHasSeqIdx) {
-                out_vals[i] += weight_vals[w] * x_vals[i + w];
-            } else {
-                out_vals[i] += seq_idx_thread[i + w] == seq_idx_cur ? weight_vals[w] * x_vals[i + w] : 0.f;
+        const int current_l_global = chunk_l_id * kChunkSizeL + col_idx * kLPerThread + i;
+        if (current_l_global < params.seqlen) {
+            const int seq_idx_cur = !kHasSeqIdx ? 0 : seq_idx_thread[i + kWidth - 1];
+            #pragma unroll
+            for (int w = 0; w < kWidth; ++w) {
+                if constexpr (!kHasSeqIdx) {
+                    out_vals[i] += weight_vals[w] * x_vals[i + w];
+                } else {
+                    out_vals[i] += seq_idx_thread[i + w] == seq_idx_cur ? weight_vals[w] * x_vals[i + w] : 0.f;
+                }
             }
+            if (params.silu_activation) {out_vals[i] = out_vals[i] / (1 + expf(-out_vals[i])); }
+        } else {
+            // Make sure padding tokens are 0 after activation.
+            if (params.silu_activation) { out_vals[i] = 0.f; }
         }
-        if (params.silu_activation) {out_vals[i] = out_vals[i] / (1 + expf(-out_vals[i])); }
     }
 
     __syncthreads();
